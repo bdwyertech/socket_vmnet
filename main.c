@@ -73,7 +73,7 @@ static void print_vmnet_start_param(xpc_object_t param) {
 }
 
 struct conn {
-  // TODO: uint8_t mac[6];
+  uint8_t mac[6]; // Store the MAC address for this connection
   int socket_fd;
   struct conn *next;
 } _conn;
@@ -85,9 +85,10 @@ struct state {
   struct conn *conns; // TODO: avoid O(N) lookup
 } _state;
 
-static void state_add_socket_fd(struct state *state, int socket_fd) {
+static void state_add_socket_fd(struct state *state, int socket_fd, uint8_t mac[6]) {
   struct conn *conn = calloc(1, sizeof(*conn));
   conn->socket_fd = socket_fd;
+  memcpy(conn->mac, mac, 6); // Store the MAC address
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
   if (state->conns == NULL) {
     state->conns = conn;
@@ -119,7 +120,19 @@ static void state_remove_socket_fd(struct state *state, int socket_fd) {
 }
 
 static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, int64_t max_bytes,
-                                        struct state *state) {
+                                         struct state *state) {
+  uint8_t dest_mac[6];
+  // Extract destination MAC address from the packet (pseudo-code for illustration)
+  // Assume `extract_dest_mac` is a helper function that extracts the MAC address
+  extract_dest_mac(packet, dest_mac);
+
+  for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
+    if (memcmp(dest_mac, conn->mac, 6) == 0 || memcmp(dest_mac, "\xff\xff\xff\xff\xff\xff", 6) == 0) {
+      // Forward packet to the matching socket or broadcast
+      send(conn->socket_fd, packet, packet_len, 0);
+    }
+  }
+}
   DEBUGF("Receiving from VMNET (buffer for %lld packets, max: %lld "
          "bytes)",
          buf_count, max_bytes);
@@ -535,7 +548,17 @@ done:
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
   INFOF("Accepted a connection (fd %d)", accept_fd);
-  state_add_socket_fd(state, accept_fd);
+
+  uint8_t mac[6];
+  ssize_t mac_read = read(accept_fd, mac, 6);
+  if (mac_read != 6) {
+    ERRORF("Failed to read MAC address from fd %d", accept_fd);
+    close(accept_fd);
+    return;
+  }
+
+  // Add the socket and its MAC to the state
+  state_add_socket_fd(state, accept_fd, mac);
   size_t buf_len = 64 * 1024;
   void *buf = malloc(buf_len);
   if (buf == NULL) {
