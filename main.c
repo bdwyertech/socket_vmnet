@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -72,151 +73,190 @@ static void print_vmnet_start_param(xpc_object_t param) {
   });
 }
 
+#define MAX_CONNECTIONS 128
+
 struct conn {
-  uint8_t mac[6]; // Store the MAC address for this connection
+  uint8_t mac[6]; // MAC address for the connection
   int socket_fd;
-  struct conn *next;
-} _conn;
+  int in_use;
+};
 
 struct state {
   dispatch_semaphore_t sem;
   dispatch_queue_t vms_queue;
   dispatch_queue_t host_queue;
-  struct conn *conns; // TODO: avoid O(N) lookup
-} _state;
+  struct conn conns[MAX_CONNECTIONS]; // Use array for O(1) lookup
+};
 
-static void state_add_socket_fd(struct state *state, int socket_fd, uint8_t mac[6]) {
-  struct conn *conn = calloc(1, sizeof(*conn));
-  conn->socket_fd = socket_fd;
-  memcpy(conn->mac, mac, 6); // Store the MAC address
+static void state_add_socket_fd(struct state *state, int socket_fd, const uint8_t *mac) {
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-  if (state->conns == NULL) {
-    state->conns = conn;
-  } else {
-    struct conn *last;
-    for (last = state->conns; last->next != NULL; last = last->next)
-      ;
-    last->next = conn;
+  // Check for duplicate socket_fd and clean up if found
+  for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+    if (state->conns[i].in_use && state->conns[i].socket_fd == socket_fd) {
+      WARN("Duplicate socket_fd detected, closing previous connection");
+      close(state->conns[i].socket_fd);
+      state->conns[i].in_use = 0;
+      break;
+    }
+  }
+  // Add new connection
+  for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+    if (!state->conns[i].in_use) {
+      state->conns[i].socket_fd = socket_fd;
+      state->conns[i].in_use = 1;
+      if (mac)
+        memcpy(state->conns[i].mac, mac, 6);
+      else
+        memset(state->conns[i].mac, 0, 6);
+      break;
+    }
   }
   dispatch_semaphore_signal(state->sem);
 }
 
 static void state_remove_socket_fd(struct state *state, int socket_fd) {
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-  if (state->conns != NULL) {
-    if (state->conns->socket_fd == socket_fd) {
-      state->conns = state->conns->next;
-    } else {
-      struct conn *conn;
-      for (conn = state->conns; conn->next != NULL; conn = conn->next) {
-        if (conn->next->socket_fd == socket_fd) {
-          conn->next = conn->next->next;
-          break;
-        }
-      }
+  for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+    if (state->conns[i].in_use && state->conns[i].socket_fd == socket_fd) {
+      state->conns[i].in_use = 0;
+      break;
     }
   }
   dispatch_semaphore_signal(state->sem);
 }
 
-static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, int64_t max_bytes,
-                                         struct state *state) {
-  uint8_t dest_mac[6];
-  // Extract destination MAC address from the packet (pseudo-code for illustration)
-  // Assume `extract_dest_mac` is a helper function that extracts the MAC address
-  extract_dest_mac(packet, dest_mac);
-
-  for (struct conn *conn = state->conns; conn != NULL; conn = conn->next) {
-    if (memcmp(dest_mac, conn->mac, 6) == 0 || memcmp(dest_mac, "\xff\xff\xff\xff\xff\xff", 6) == 0) {
-      // Forward packet to the matching socket or broadcast
-      send(conn->socket_fd, packet, packet_len, 0);
-    }
+// Helper function to check if MAC address is broadcast or multicast
+static int is_broadcast_or_multicast(const uint8_t *mac) {
+  // Broadcast: FF:FF:FF:FF:FF:FF
+  static const uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  if (memcmp(mac, broadcast, 6) == 0) {
+    return 1;
   }
+  // Multicast: first bit of first octet is 1
+  return (mac[0] & 0x01) != 0;
 }
-  DEBUGF("Receiving from VMNET (buffer for %lld packets, max: %lld "
-         "bytes)",
-         buf_count, max_bytes);
-  // TODO: use prealloced pool
-  struct vmpktdesc *pdv = calloc(buf_count, sizeof(struct vmpktdesc));
-  if (pdv == NULL) {
-    ERRORN("calloc(estim_count, sizeof(struct vmpktdesc)");
-    goto done;
-  }
-  for (int i = 0; i < buf_count; i++) {
-    pdv[i].vm_flags = 0;
-    pdv[i].vm_pkt_size = max_bytes;
-    pdv[i].vm_pkt_iovcnt = 1, pdv[i].vm_pkt_iov = malloc(sizeof(struct iovec));
-    if (pdv[i].vm_pkt_iov == NULL) {
-      ERRORN("malloc(sizeof(struct iovec))");
-      goto done;
+
+// Helper function to check if MAC address is zero (unlearned)
+static int is_mac_zero(const uint8_t *mac) {
+  static const uint8_t zero[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  return memcmp(mac, zero, 6) == 0;
+}
+
+// Helper function to update the MAC address for a connection
+static void state_update_mac(struct state *state, int socket_fd, const uint8_t *mac) {
+  dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+  for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+    if (state->conns[i].in_use && state->conns[i].socket_fd == socket_fd) {
+      memcpy(state->conns[i].mac, mac, 6);
+      DEBUGF("Learned MAC %02X:%02X:%02X:%02X:%02X:%02X for socket %d", mac[0], mac[1], mac[2],
+             mac[3], mac[4], mac[5], socket_fd);
+      break;
     }
-    pdv[i].vm_pkt_iov->iov_base = malloc(max_bytes);
-    if (pdv[i].vm_pkt_iov->iov_base == NULL) {
-      ERRORN("malloc(max_bytes)");
-      goto done;
-    }
-    pdv[i].vm_pkt_iov->iov_len = max_bytes;
   }
-  int received_count = buf_count;
-  vmnet_return_t read_status = vmnet_read(iface, pdv, &received_count);
+  dispatch_semaphore_signal(state->sem);
+}
+
+// Preallocated pool for vmpktdesc and buffers
+#define PREALLOC_POOL_SIZE 64
+static struct vmpktdesc prealloc_pdv[PREALLOC_POOL_SIZE];
+static struct iovec prealloc_iov[PREALLOC_POOL_SIZE];
+static uint8_t *prealloc_bufs[PREALLOC_POOL_SIZE];
+static int prealloc_initialized = 0;
+
+static void prealloc_init(size_t max_bytes) {
+  for (int i = 0; i < PREALLOC_POOL_SIZE; ++i) {
+    if (!prealloc_bufs[i]) {
+      prealloc_bufs[i] = malloc(max_bytes);
+    }
+    prealloc_iov[i].iov_base = prealloc_bufs[i];
+    prealloc_iov[i].iov_len = max_bytes;
+    prealloc_pdv[i].vm_flags = 0;
+    prealloc_pdv[i].vm_pkt_size = max_bytes;
+    prealloc_pdv[i].vm_pkt_iovcnt = 1;
+    prealloc_pdv[i].vm_pkt_iov = &prealloc_iov[i];
+  }
+  prealloc_initialized = 1;
+}
+
+static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, int64_t max_bytes,
+                                        struct state *state) {
+  DEBUGF("Receiving from VMNET (buffer for %lld packets, max: %lld bytes)", buf_count, max_bytes);
+  prealloc_init(max_bytes); // Use preallocated pool
+  int use_count = buf_count > PREALLOC_POOL_SIZE ? PREALLOC_POOL_SIZE : buf_count;
+  for (int i = 0; i < use_count; ++i) {
+    prealloc_pdv[i].vm_pkt_size = max_bytes;
+    prealloc_iov[i].iov_len = max_bytes;
+  }
+  int received_count = use_count;
+  vmnet_return_t read_status = vmnet_read(iface, prealloc_pdv, &received_count);
   if (read_status != VMNET_SUCCESS) {
     ERRORF("vmnet_read: [%d] %s", read_status, vmnet_strerror(read_status));
-    goto done;
+    return;
   }
-
   DEBUGF("Received from VMNET: %d packets (buffer was prepared for %lld packets)", received_count,
          buf_count);
   for (int i = 0; i < received_count; i++) {
+    // Set iov_len to the actual received size for each packet
+    prealloc_iov[i].iov_len = prealloc_pdv[i].vm_pkt_size;
     uint8_t dest_mac[6], src_mac[6];
-    assert(pdv[i].vm_pkt_iov[0].iov_len > 12);
-    const char *packet = (const char *)pdv[i].vm_pkt_iov[0].iov_base;
+    assert(prealloc_pdv[i].vm_pkt_iov[0].iov_len > 12);
+    const char *packet = (const char *)prealloc_pdv[i].vm_pkt_iov[0].iov_base;
     memcpy(dest_mac, packet, sizeof(dest_mac));
     memcpy(src_mac, packet + 6, sizeof(src_mac));
-    DEBUGF("[Handler i=%d] Dest %02X:%02X:%02X:%02X:%02X:%02X, Src "
-           "%02X:%02X:%02X:%02X:%02X:%02X,",
+    DEBUGF("[Handler i=%d] Dest %02X:%02X:%02X:%02X:%02X:%02X, Src %02X:%02X:%02X:%02X:%02X:%02X,",
            i, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
     dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      // FIXME: avoid flooding
-      DEBUGF("[Handler i=%d] Sending to the socket %d: 4 + %ld bytes [Dest "
-             "%02X:%02X:%02X:%02X:%02X:%02X]",
-             i, conn->socket_fd, pdv[i].vm_pkt_size, dest_mac[0], dest_mac[1], dest_mac[2],
-             dest_mac[3], dest_mac[4], dest_mac[5]);
-      uint32_t header_be = htonl(pdv[i].vm_pkt_size);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = pdv[i].vm_pkt_iov[0].iov_base,
-           .iov_len = pdv[i].vm_pkt_size, // not vm_pkt_iov[0].iov_len
-          },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Handler i=%d] Sent to the socket: %ld bytes (including uint32be "
-             "header)",
-             i, written);
-      if (written < 0) {
-        ERRORN("writev");
-        goto done;
-      }
-    }
-  }
-done:
-  if (pdv != NULL) {
-    for (int i = 0; i < buf_count; i++) {
-      if (pdv[i].vm_pkt_iov != NULL) {
-        if (pdv[i].vm_pkt_iov->iov_base != NULL) {
-          free(pdv[i].vm_pkt_iov->iov_base);
+    // MAC learning and selective forwarding for vmnet-to-socket packets
+    int is_broadcast = is_broadcast_or_multicast(dest_mac);
+    int found_unicast = 0;
+    int match_index = -1;
+
+    // First, check if any connection matches the destination MAC
+    if (!is_broadcast) {
+      for (int c = 0; c < MAX_CONNECTIONS; ++c) {
+        struct conn *conn = &state->conns[c];
+        if (!conn->in_use)
+          continue;
+        if (!is_mac_zero(conn->mac) && memcmp(conn->mac, dest_mac, 6) == 0) {
+          found_unicast = 1;
+          match_index = c;
+          break;
         }
-        free(pdv[i].vm_pkt_iov);
       }
     }
-    free(pdv);
+
+    for (int c = 0; c < MAX_CONNECTIONS; ++c) {
+      struct conn *conn = &state->conns[c];
+      if (!conn->in_use)
+        continue;
+
+      // Broadcast/multicast, or unknown unicast (flood), or known unicast (only to match)
+      if (is_broadcast || (!found_unicast) || (found_unicast && c == match_index)) {
+        DEBUGF("[Handler i=%d] Sending to the socket %d: 4 + %ld bytes [Dest "
+               "%02X:%02X:%02X:%02X:%02X:%02X]",
+               i, conn->socket_fd, prealloc_pdv[i].vm_pkt_size, dest_mac[0], dest_mac[1],
+               dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5]);
+        uint32_t header_be = htonl(prealloc_pdv[i].vm_pkt_size);
+        struct iovec iov[2] = {
+            {.iov_base = &header_be,                             .iov_len = 4},
+            {.iov_base = prealloc_pdv[i].vm_pkt_iov[0].iov_base,
+             .iov_len = prealloc_pdv[i].vm_pkt_size                          },
+        };
+        ssize_t written = writev(conn->socket_fd, iov, 2);
+        DEBUGF("[Handler i=%d] Sent to the socket: %ld bytes (including uint32be header)", i,
+               written);
+        if (written < 0) {
+          ERRORN("writev");
+        }
+
+        // For known unicast, only send to the matching connection
+        if (found_unicast && c == match_index) {
+          break;
+        }
+      }
+    }
+    dispatch_semaphore_signal(state->sem);
   }
 }
 
@@ -548,17 +588,7 @@ done:
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
   INFOF("Accepted a connection (fd %d)", accept_fd);
-
-  uint8_t mac[6];
-  ssize_t mac_read = read(accept_fd, mac, 6);
-  if (mac_read != 6) {
-    ERRORF("Failed to read MAC address from fd %d", accept_fd);
-    close(accept_fd);
-    return;
-  }
-
-  // Add the socket and its MAC to the state
-  state_add_socket_fd(state, accept_fd, mac);
+  state_add_socket_fd(state, accept_fd, NULL); // MAC will be learned from first packet
   size_t buf_len = 64 * 1024;
   void *buf = malloc(buf_len);
   if (buf == NULL) {
@@ -612,36 +642,54 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     }
     DEBUGF("[Socket-to-VMNET i=%lld] Sent to VMNET: %ld bytes", i, pd.vm_pkt_size);
 
-    // Flood the packet to other VMs in the same network too.
-    // (Not handled by vmnet)
-    // FIXME: avoid flooding
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      if (conn->socket_fd == accept_fd)
-        continue;
-      DEBUGF("[Socket-to-Socket i=%lld] Sending from socket %d to socket %d: "
-             "4 + %d bytes",
-             i, accept_fd, conn->socket_fd, header);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = buf,
-           .iov_len = header,
-           },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Socket-to-Socket i=%lld] Sent from socket %d to socket %d: %ld "
-             "bytes (including uint32be header)",
-             i, accept_fd, conn->socket_fd, written);
-      if (written < 0) {
-        ERRORN("writev");
-        continue;
+    // MAC learning and selective forwarding
+    if (header >= 14) { // Ethernet header size
+      uint8_t *eth = (uint8_t *)buf;
+      uint8_t *dst_mac = eth;
+      uint8_t *src_mac = eth + 6;
+      // Learn the source MAC for this socket
+      if (!is_mac_zero(src_mac)) {
+        state_update_mac(state, accept_fd, src_mac);
       }
+      int is_broadcast = is_broadcast_or_multicast(dst_mac);
+      int found_unicast = 0;
+      int match_index = -1;
+      dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+      // First, check if any connection matches the destination MAC
+      if (!is_broadcast) {
+        for (int c = 0; c < MAX_CONNECTIONS; ++c) {
+          struct conn *conn = &state->conns[c];
+          if (!conn->in_use || conn->socket_fd == accept_fd)
+            continue;
+          if (!is_mac_zero(conn->mac) && memcmp(conn->mac, dst_mac, 6) == 0) {
+            found_unicast = 1;
+            match_index = c;
+            break;
+          }
+        }
+      }
+      for (int c = 0; c < MAX_CONNECTIONS; ++c) {
+        struct conn *conn = &state->conns[c];
+        if (!conn->in_use || conn->socket_fd == accept_fd)
+          continue;
+        // Broadcast/multicast, or unknown unicast (flood), or known unicast (only to match)
+        if (is_broadcast || (!found_unicast) || (found_unicast && c == match_index)) {
+          DEBUGF("[Socket-to-Socket i=%lld] Sending from socket %d to socket %d: 4 + %d bytes", i,
+                 accept_fd, conn->socket_fd, header);
+          struct iovec iov2[2] = {
+              {.iov_base = &header_be, .iov_len = 4     },
+              {.iov_base = buf,        .iov_len = header},
+          };
+          ssize_t written = writev(conn->socket_fd, iov2, 2);
+          DEBUGF("[Socket-to-Socket i=%lld] Sent from socket %d to socket %d: %ld bytes (including "
+                 "uint32be header)",
+                 i, accept_fd, conn->socket_fd, written);
+          if (written < 0) {
+            ERRORN("writev");
+          }
+        }
+      }
+      dispatch_semaphore_signal(state->sem);
     }
   }
 done:
